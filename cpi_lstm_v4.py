@@ -1,5 +1,6 @@
 
 
+import os
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -14,13 +15,22 @@ from sklearn.ensemble import RandomForestRegressor
 
 
 # config stuff
-CSV_PATH = "/Users/nikhilneelagaru/Desktop/fred-md.csv"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(BASE_DIR, "fred-md.csv")
+MODEL_PATH = os.path.join(BASE_DIR, "cpi_lstm_model.pt")
+PREDICTIONS_PATH = os.path.join(BASE_DIR, "predictions_test.csv")
+IMPORTANCES_PATH = os.path.join(BASE_DIR, "feature_importances.csv")
+WALK_FORWARD_PATH = os.path.join(BASE_DIR, "walk_forward_results.csv")
 TARGET = "CPIAUCSL"
 
 HORIZON = 1       # how many months ahead to predict
 SEQ_LEN = 24      # input window in months
 TRAIN_FRAC = 0.70
 VAL_FRAC = 0.15   # rest goes to test
+
+# walk-forward backtest
+WF_N_FOLDS = 5
+WF_MIN_TRAIN_FRAC = 0.50   # fraction of history reserved before the first test fold
 
 # feature selection
 VARIANCE_EPS = 1e-8
@@ -99,9 +109,10 @@ def select_features(X_train, y_train_delta, top_k_corr=TOP_K_CORR, top_k_rf=TOP_
     
     Returns
     -------
-    list of column names to keep
+    cols_final  : list of column names to keep
+    importances : RF importance for each of those columns, sorted descending
     """
-    
+
     # stage 1
     vt = VarianceThreshold(threshold=VARIANCE_EPS)
     vt.fit(X_train.values)
@@ -122,8 +133,8 @@ def select_features(X_train, y_train_delta, top_k_corr=TOP_K_CORR, top_k_rf=TOP_
     cols_final = importances.head(min(top_k_rf, len(importances))).index.tolist()
     
     print(f"feature selection: {X_train.shape[1]} -> {len(cols_stage1)} (var) -> {len(cols_stage2)} (corr) -> {len(cols_final)} (RF)")
-    
-    return cols_final
+
+    return cols_final, importances.loc[cols_final]
 
 
 def build_sequences(features_arr, level_arr, seq_len, horizon):
@@ -290,20 +301,54 @@ def predict_array(model, X):
         return model(x).cpu().numpy()
 
 
+def save_artifacts(model, selected_cols, f_mean, f_std, y_mean, y_std, input_size, path=MODEL_PATH):
+    """
+    saves everything needed to run inference later without retraining:
+    weights, the selected feature columns (order matters, matches f_mean/f_std),
+    the target standardization stats, and the model/sequence config.
+    """
+
+    torch.save({
+        "model_state_dict": model.state_dict(),
+        "selected_cols": selected_cols,
+        "f_mean": f_mean,
+        "f_std": f_std,
+        "y_mean": y_mean,
+        "y_std": y_std,
+        "input_size": input_size,
+        "seq_len": SEQ_LEN,
+        "horizon": HORIZON,
+        "hidden_size": HIDDEN_SIZE,
+        "num_layers": NUM_LAYERS,
+        "dropout": DROPOUT,
+    }, path)
+
+    print(f"saved model artifacts to {path}")
+
+
+def compute_metrics(y_true, y_pred):
+    """
+    rmse / mae / mape for a set of predictions, no printing
+    """
+
+    err = y_pred - y_true
+    rmse = float(np.sqrt(np.mean(err ** 2)))
+    mae = float(np.mean(np.abs(err)))
+
+    denom = np.where(np.abs(y_true) < 1e-8, np.nan, y_true)
+    mape = float(np.nanmean(np.abs(err / denom)) * 100)
+
+    return rmse, mae, mape
+
+
 def report_metrics(y_true, y_pred, label):
     """
     prints rmse / mae / mape for a set of predictions
     """
-    
-    err = y_pred - y_true
-    rmse = float(np.sqrt(np.mean(err ** 2)))
-    mae = float(np.mean(np.abs(err)))
-    
-    denom = np.where(np.abs(y_true) < 1e-8, np.nan, y_true)
-    mape = float(np.nanmean(np.abs(err / denom)) * 100)
-    
+
+    rmse, mae, mape = compute_metrics(y_true, y_pred)
     print(f"{label:18s} RMSE {rmse:.4f} | MAE {mae:.4f} | MAPE {mape:.3f}%")
-    
+
     return rmse, mae, mape
 
 
@@ -393,14 +438,135 @@ def plot_pred_vs_actual(dates_test, y_true_delta, y_pred_delta,
     print(f"saved {path}")
 
 
+def walk_forward_backtest(feat_diff_full, target_level, dates,
+                          n_folds=WF_N_FOLDS, min_train_frac=WF_MIN_TRAIN_FRAC):
+    """
+    expanding-window walk-forward backtest.
+
+    each fold refits feature selection, standardization, and a fresh LSTM
+    from scratch using only that fold's own training window (no leakage
+    across folds), then scores the LSTM and a persistence baseline
+    (predict no change) on that fold's held-out test block. training
+    windows expand over time; test blocks partition the back half of the
+    series so results span multiple macro regimes instead of one arbitrary
+    split.
+
+    Returns
+    -------
+    dataframe with one row per fold: date range, sample count, and
+    LSTM vs. baseline RMSE/MAE/MAPE (on the CPI level)
+    """
+
+    n = len(feat_diff_full)
+    level_arr = target_level.values.astype(np.float32)
+
+    y_delta_full = np.full(n, np.nan, dtype=np.float32)
+    y_delta_full[: n - HORIZON] = level_arr[HORIZON:] - level_arr[: n - HORIZON]
+
+    test_region_start = int(n * min_train_frac)
+    val_len = int(n * VAL_FRAC)
+    fold_size = (n - test_region_start) // n_folds
+
+    results = []
+
+    for fold in range(n_folds):
+        test_start = test_region_start + fold * fold_size
+        test_end = n if fold == n_folds - 1 else test_start + fold_size
+        val_end = test_start
+        train_end = val_end - val_len
+
+        if train_end < SEQ_LEN + HORIZON + 10:
+            print(f"fold {fold}: skipped, not enough training history")
+            continue
+
+        # feature selection + standardization fit only on this fold's train rows
+        fs_mask = np.zeros(n, dtype=bool)
+        fs_mask[: max(train_end - HORIZON, 0)] = True
+        fs_mask &= ~np.isnan(y_delta_full)
+
+        cols, _ = select_features(feat_diff_full.loc[fs_mask], y_delta_full[fs_mask])
+        feat_fold = feat_diff_full[cols]
+
+        feat_train = feat_fold.iloc[:train_end].values
+        f_mean = feat_train.mean(axis=0)
+        f_std = feat_train.std(axis=0) + 1e-8
+        feat_std = (feat_fold.values - f_mean) / f_std
+
+        X_all, y_all_raw, base_all, anchors_all = build_sequences(feat_std, level_arr, SEQ_LEN, HORIZON)
+        target_times = anchors_all + HORIZON
+
+        train_sel = target_times < train_end
+        val_sel = (target_times >= train_end) & (target_times < val_end)
+        test_sel = (target_times >= val_end) & (target_times < test_end)
+
+        if train_sel.sum() < BATCH_SIZE or val_sel.sum() == 0 or test_sel.sum() == 0:
+            print(f"fold {fold}: skipped, not enough sequences")
+            continue
+
+        y_mean = float(y_all_raw[train_sel].mean())
+        y_std = float(y_all_raw[train_sel].std() + 1e-8)
+        y_all = (y_all_raw - y_mean) / y_std
+
+        X_train, y_train = X_all[train_sel], y_all[train_sel]
+        X_val, y_val = X_all[val_sel], y_all[val_sel]
+        X_test = X_all[test_sel]
+
+        base_test = base_all[test_sel]
+        y_true_delta = y_all_raw[test_sel]
+
+        train_loader = DataLoader(
+            TensorDataset(torch.tensor(X_train), torch.tensor(y_train)),
+            batch_size=BATCH_SIZE, shuffle=True,
+        )
+        val_loader = DataLoader(
+            TensorDataset(torch.tensor(X_val), torch.tensor(y_val)),
+            batch_size=BATCH_SIZE, shuffle=False,
+        )
+
+        set_seed(SEED)
+        model = LSTMForecaster(input_size=X_train.shape[2]).to(DEVICE)
+        train_model(model, train_loader, val_loader)
+
+        pred_std = predict_array(model, X_test)
+        y_pred_delta = pred_std * y_std + y_mean
+
+        y_pred_level = base_test + y_pred_delta
+        y_true_level = base_test + y_true_delta
+
+        # persistence baseline: predict no change
+        baseline_pred_level = base_test
+
+        lstm_rmse, lstm_mae, lstm_mape = compute_metrics(y_true_level, y_pred_level)
+        base_rmse, base_mae, base_mape = compute_metrics(y_true_level, baseline_pred_level)
+
+        test_start_date = dates.iloc[min(test_start, n - 1)].date()
+        test_end_date = dates.iloc[min(test_end, n) - 1].date()
+
+        print(f"fold {fold} [{test_start_date} -> {test_end_date}] n_test={int(test_sel.sum())} | "
+              f"LSTM RMSE {lstm_rmse:.4f} MAE {lstm_mae:.4f} | "
+              f"baseline RMSE {base_rmse:.4f} MAE {base_mae:.4f}")
+
+        results.append({
+            "fold": fold,
+            "test_start": test_start_date,
+            "test_end": test_end_date,
+            "n_test": int(test_sel.sum()),
+            "lstm_rmse": lstm_rmse, "lstm_mae": lstm_mae, "lstm_mape": lstm_mape,
+            "baseline_rmse": base_rmse, "baseline_mae": base_mae, "baseline_mape": base_mape,
+        })
+
+    return pd.DataFrame(results)
+
+
 def main():
     print(f"device: {DEVICE}")
     print(f"horizon: {HORIZON} month(s) ahead")
     
     # load and difference
     feat_diff, target_level, dates = load_and_transform(CSV_PATH, TARGET)
+    feat_diff_full = feat_diff.copy()  # all candidate cols, kept for the walk-forward backtest
     print(f"after differencing: {len(feat_diff)} rows, {feat_diff.shape[1]} candidate features")
-    
+
     # split sizes
     n = len(feat_diff)
     n_train = int(n * TRAIN_FRAC)
@@ -416,7 +582,7 @@ def main():
     fs_mask[: max(n_train - HORIZON, 0)] = True
     fs_mask &= ~np.isnan(y_delta_full)
     
-    selected_cols = select_features(feat_diff.loc[fs_mask], y_delta_full[fs_mask])
+    selected_cols, feature_importances = select_features(feat_diff.loc[fs_mask], y_delta_full[fs_mask])
     feat_diff = feat_diff[selected_cols]
     
     # standardize features using training stats only
@@ -463,7 +629,10 @@ def main():
     
     # train
     history = train_model(model, train_loader, val_loader)
-    
+
+    # save trained model + everything needed to run inference later
+    save_artifacts(model, selected_cols, f_mean, f_std, y_mean, y_std, X_train.shape[2])
+
     # predict on test set and invert standardization
     pred_std = predict_array(model, X_test)
     y_pred_delta = pred_std * y_std + y_mean
@@ -473,20 +642,67 @@ def main():
     y_pred_level = base_test + y_pred_delta
     y_true_level = base_test + y_true_delta
     
+    # naive baseline: persistence / random walk (predict no change)
+    baseline_pred_delta = np.zeros_like(y_true_delta)
+    baseline_pred_level = base_test
+
     # metrics
     print()
-    print("test set metrics")
+    print("test set metrics -- LSTM")
     report_metrics(y_true_delta, y_pred_delta, "delta CPIAUCSL")
     report_metrics(y_true_level, y_pred_level, "level CPIAUCSL")
-    
+
+    print()
+    print("test set metrics -- baseline (persistence / random walk)")
+    report_metrics(y_true_delta, baseline_pred_delta, "delta CPIAUCSL")
+    report_metrics(y_true_level, baseline_pred_level, "level CPIAUCSL")
+
     # plots (dates correspond to t + HORIZON)
     test_target_times = anchors_test + HORIZON
     dates_test = pd.to_datetime(dates.iloc[test_target_times].values)
-    
+
     plot_losses(history, "loss_curves.png")
     plot_pred_vs_actual(dates_test, y_true_delta, y_pred_delta,
                         y_true_level, y_pred_level, "pred_vs_actual.png")
-    
+
+    # export raw predictions so a researcher can pull results into their own tools
+    predictions_df = pd.DataFrame({
+        "date": dates_test,
+        "actual_delta": y_true_delta,
+        "pred_delta_lstm": y_pred_delta,
+        "pred_delta_baseline": baseline_pred_delta,
+        "actual_level": y_true_level,
+        "pred_level_lstm": y_pred_level,
+        "pred_level_baseline": baseline_pred_level,
+    })
+    predictions_df.to_csv(PREDICTIONS_PATH, index=False)
+    print(f"saved {PREDICTIONS_PATH}")
+
+    # export feature importances from the RF stage of feature selection
+    importances_df = feature_importances.rename("importance").rename_axis("feature").reset_index()
+    importances_df.to_csv(IMPORTANCES_PATH, index=False)
+    print(f"saved {IMPORTANCES_PATH}")
+
+    # walk-forward backtest: LSTM vs. baseline across multiple rolling windows,
+    # so we can see whether performance holds up across different macro regimes
+    # rather than being an artifact of this one 70/15/15 split
+    print()
+    print(f"walk-forward backtest ({WF_N_FOLDS} folds, LSTM vs. persistence baseline)")
+    wf_results = walk_forward_backtest(feat_diff_full, target_level, dates)
+
+    if not wf_results.empty:
+        wf_results.to_csv(WALK_FORWARD_PATH, index=False)
+        print(f"saved {WALK_FORWARD_PATH}")
+
+        print()
+        print("walk-forward summary (level RMSE, mean +/- std across folds)")
+        print(f"  LSTM:     {wf_results['lstm_rmse'].mean():.4f} +/- {wf_results['lstm_rmse'].std():.4f}")
+        print(f"  baseline: {wf_results['baseline_rmse'].mean():.4f} +/- {wf_results['baseline_rmse'].std():.4f}")
+        beat_baseline = int((wf_results["lstm_rmse"] < wf_results["baseline_rmse"]).sum())
+        print(f"  LSTM beat the baseline in {beat_baseline}/{len(wf_results)} folds")
+    else:
+        print("walk-forward backtest produced no folds (not enough data)")
+
     plt.show()
 
 
